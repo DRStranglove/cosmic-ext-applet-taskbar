@@ -1,0 +1,85 @@
+[package]
+name = "cosmic-ext-applet-taskbar"
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A Windows-style taskbar applet for the COSMIC desktop: one labeled button per open window."
+repository = "https://github.com/DRStranglove/cosmic-ext-applet-taskbar"
+readme = "README.md"
+
+[[bin]]
+name = "cosmic-ext-applet-taskbar"
+path = "src/main.rs"
+
+[dependencies]
+cosmic-app-list-config = { path = "cosmic-app-list-config" }
+anyhow.workspace = true
+cctk.workspace = true
+cosmic-protocols.workspace = true
+futures.workspace = true
+i18n-embed.workspace = true
+i18n-embed-fl.workspace = true
+image = { version = "0.25.9", default-features = false }
+libcosmic.workspace = true
+memmap2 = "0.9.10"
+fastrand = "2.3.0"
+rust-embed.workspace = true
+rustix.workspace = true
+rustc-hash.workspace = true
+switcheroo-control = { git = "https://github.com/pop-os/dbus-settings-bindings", rev = "eed01dd" }
+tokio.workspace = true
+tracing-log.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url = "2.5.8"
+zbus.workspace = true
+
+# Single-package workspace: the config crate is a vendored member so the whole
+# thing is self-contained (no dependency on the full pop-os/cosmic-applets tree).
+[workspace]
+members = ["cosmic-app-list-config"]
+
+# Dependency versions/revisions pinned to what this fork was developed against
+# (libcosmic + cosmic-protocols move fast and their APIs are unstable). If a
+# COSMIC update breaks the build, bump these revs and fix any fallout.
+[workspace.dependencies]
+anyhow = "1.0.102"
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "c253ec1" }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", default-features = false, features = [
+    "client",
+], rev = "c253ec1" }
+futures = "0.3"
+i18n-embed = { version = "0.16.0", features = [
+    "fluent-system",
+    "desktop-requester",
+] }
+i18n-embed-fl = "0.10"
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "758c137", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "dbus-config",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "desktop-systemd-scope",
+    "winit",
+] }
+rust-embed = "8.11.0"
+rustc-hash = "2.1"
+rustix = { version = "1.1", features = ["fs", "process"] }
+zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-log = "0.2.0"
+tokio = { version = "1.49.0", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# libcosmic/cctk depend on the smithay client-toolkit via git; redirect it to the
+# published crate the pinned revs expect. (Mirrors pop-os/cosmic-applets.)
+[patch."https://github.com/smithay/client-toolkit.git"]
+sctk = { package = "smithay-client-toolkit", version = "0.20.0" }
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"

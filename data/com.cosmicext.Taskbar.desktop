@@ -1,0 +1,16 @@
+[Desktop Entry]
+Name=Taskbar
+Comment=Windows-style taskbar: one labeled button per open window
+Type=Application
+Exec=cosmic-ext-applet-taskbar
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Task;Bar;Window;List;
+Icon=com.system76.CosmicAppList
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-MinimizeApplet=5
+X-OverflowPriority=100
+X-OverflowMinSize=4
+X-HostWaylandDisplay=true
