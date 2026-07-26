@@ -15,10 +15,13 @@ see and reach every window at a glance.
 - **Icon + title label**, Windows 7+ style. Empty-title windows (e.g. RustDesk) fall
   back to the application name so every button is labeled.
 - **Click to focus, click again to minimize.**
-- **Fixed-width buttons** with end-ellipsis (`Long window titl…`) for a tidy, uniform bar.
+- **Uniform, elastic buttons** with end-ellipsis (`Long window titl…`): every button
+  is the same width, and they shrink together as more windows open instead of the
+  bar growing ragged.
 - **Hover tooltip** shows the full, untruncated window title.
-- **Overflow handling**: when many windows are open, the extras collapse into a
-  popup behind a chevron button — nothing spills off the panel.
+- **Overflow handling**: buttons shrink first, and once titles would get too short
+  to read, the extra windows fold into a popup behind a chevron (`⌃`) button —
+  nothing is ever dropped or pushed off the end of the panel.
 - Right-click for the per-window context menu; works on any panel edge (labels on
   horizontal panels, icon-only on vertical).
 
@@ -50,6 +53,12 @@ cd cosmic-ext-applet-taskbar
 - desktop → `~/.local/share/applications/com.cosmicext.Taskbar.desktop`
 
 The first build compiles libcosmic from source and takes ~10–15 minutes.
+
+**Upgrading?** The panel keeps running the old binary until it is restarted:
+
+```sh
+kill "$(pgrep -x cosmic-panel)"   # cosmic-session respawns it immediately
+```
 
 ## Add it to your panel
 

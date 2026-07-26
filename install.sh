@@ -40,4 +40,7 @@ Done. Now add it to a bar:
   Settings -> Desktop -> Panel (or Dock) -> Configure applets -> + Add -> "Taskbar"
 Then remove the stock "App Tray" from that same bar.
 If "Taskbar" isn't listed, close and reopen Settings.
+
+Upgrading an existing install? Restart the panel to pick up the new binary:
+  kill "\$(pgrep -x cosmic-panel)"
 EOF
