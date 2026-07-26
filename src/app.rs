@@ -148,19 +148,44 @@ impl AppletIconData {
     }
 }
 
-/// Width (logical px) reserved for a taskbar button's title label before it
-/// ellipsizes (~Windows-taskbar density). Defined once so the on-screen label
-/// (`as_icon`) and the panel-overflow math (`panel_overflow_lengths`) agree on
-/// how wide a window button is — otherwise overflow triggers at the wrong count
-/// and buttons get clipped off the end of the panel.
+/// Widest (logical px) a taskbar button's title label gets before it ellipsizes
+/// (~Windows-taskbar density). Labels only reach this when the panel has room:
+/// as windows pile up they shrink toward [`taskbar_label_min_width`] first, and
+/// only then do windows move into the overflow popup.
 fn taskbar_label_width(icon_size: u16) -> f32 {
     icon_size as f32 * 5.0
 }
 
-/// Extra major-axis width a window button needs on top of the icon: the title
-/// label plus the icon↔label row spacing used in `as_icon`.
-fn taskbar_label_extent(icon_size: u16) -> u16 {
-    taskbar_label_width(icon_size) as u16 + 8
+/// Narrowest a title label may shrink to. Past this a label is too short to tell
+/// windows apart, so extra windows go to the overflow popup instead.
+fn taskbar_label_min_width(icon_size: u16) -> f32 {
+    icon_size as f32 * 2.0
+}
+
+/// Gap between a window button's icon and its title label (see `as_icon`).
+const TASKBAR_LABEL_SPACING: f32 = 8.0;
+
+/// Major-axis space a window button spends on everything *except* the label:
+/// icon + button padding + icon↔label gap + the spacing to the next button.
+/// Kept next to `as_icon` so the layout math and the rendered button agree.
+fn taskbar_button_chrome(applet: &Context) -> f32 {
+    (applet.suggested_size(false).0 + applet.suggested_padding(false).0 * 2) as f32
+        + TASKBAR_LABEL_SPACING
+        + applet.spacing as f32
+}
+
+/// Major-axis size of an icon-only button (a pinned entry with no window).
+fn taskbar_icon_button_extent(applet: &Context) -> f32 {
+    (applet.suggested_size(false).0 + applet.suggested_padding(false).0 * 2) as f32
+        + applet.spacing as f32
+}
+
+/// Major-axis size of the "⌃" overflow button. It uses the symbolic icon size,
+/// so it is far narrower than a window button and must be measured separately —
+/// charging a full button's width for it wastes most of a slot.
+fn taskbar_chevron_extent(applet: &Context) -> f32 {
+    (applet.suggested_size(true).0 + applet.suggested_padding(true).0 * 2) as f32
+        + applet.spacing as f32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -207,6 +232,9 @@ impl DockItem {
         dot_border_radius: [f32; 4],
         window_id: window::Id,
         filter: Option<&dyn Fn(&ToplevelInfo) -> bool>,
+        // Width for the title label, so the panel can shrink buttons when many
+        // windows are open (popups always pass the full width).
+        label_width: f32,
     ) -> Element<'_, Message> {
         let Self {
             toplevels,
@@ -334,10 +362,10 @@ impl DockItem {
                 .ellipsize(cosmic::iced::core::text::Ellipsize::End(
                     cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
                 ))
-                .width(Length::Fixed(taskbar_label_width(app_icon.icon_size)))
+                .width(Length::Fixed(label_width))
                 .height(Length::Fixed(app_icon.icon_size as f32));
             row([icon_wrapper, label.into()])
-                .spacing(8)
+                .spacing(TASKBAR_LABEL_SPACING)
                 .align_y(Alignment::Center)
                 .into()
         } else {
@@ -782,65 +810,89 @@ impl CosmicAppList {
         Task::batch(commands)
     }
 
-    /// Returns the length of the group in the favorite list after which items are displayed in a popup.
-    /// Shrink the favorite list until it only has active windows, or until it fits in the length provided.
-    fn panel_overflow_lengths(&self) -> (Option<usize>, Option<usize>) {
-        let mut favorite_index;
-        let mut active_index = None;
-        let Some(mut max_major_axis_len) = self.core.applet.suggested_bounds.as_ref().map(|c| {
+    /// Major-axis space the panel gave this applet (minus the divider), or `None`
+    /// while the panel has not sent a size yet.
+    fn taskbar_slot_width(&self) -> Option<f32> {
+        self.core.applet.suggested_bounds.as_ref().map(|c| {
             // if we have a configure for width and height, we're in a overflow popup
-            match self.core.applet.anchor {
-                PanelAnchor::Top | PanelAnchor::Bottom => c.width as u32,
-                PanelAnchor::Left | PanelAnchor::Right => c.height as u32,
-            }
-        }) else {
-            return (None, active_index);
-        };
-        // tracing::error!("{} {}", max_major_axis_len, self.pinned_list.len());
-        // subtract the divider width
-        max_major_axis_len -= 1;
-        let applet_icon = AppletIconData::new(&self.core.applet);
+            let len = match self.core.applet.anchor {
+                PanelAnchor::Top | PanelAnchor::Bottom => c.width,
+                PanelAnchor::Left | PanelAnchor::Right => c.height,
+            };
+            (len - 1.0).max(0.0)
+        })
+    }
 
-        let button_total_size = self.core.applet.suggested_size(true).0
-            + self.core.applet.suggested_padding(true).0 * 2
-            + applet_icon.icon_spacing as u16
-            // Taskbar: each window button also carries a fixed-width title label,
-            // so it is much wider than a bare icon. Count that here or overflow
-            // fires too late and buttons spill off the end of the panel.
-            + taskbar_label_extent(self.core.applet.suggested_size(false).0);
-
-        let favorite_active_cnt = self
-            .pinned_list
+    /// Windows that actually get a button right now. `active_list` also holds
+    /// windows from other workspaces/monitors, which `view` filters out — the
+    /// layout math has to filter identically or it budgets for phantom buttons.
+    fn visible_active_count(&self) -> usize {
+        self.active_list
             .iter()
-            .filter(|t| !t.toplevels.is_empty())
-            .count();
+            .filter(|dock_item| {
+                dock_item
+                    .toplevels
+                    .iter()
+                    .any(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+            })
+            .count()
+    }
 
-        // initial calculation of favorite_index
-        let btn_count = max_major_axis_len / button_total_size as u32;
-        if btn_count >= self.pinned_list.len() as u32 + self.active_list.len() as u32 {
-            return (None, active_index);
-        } else {
-            favorite_index = (btn_count as usize).min(favorite_active_cnt).max(2);
+    /// Label width to use when `count` window buttons share the panel: full width
+    /// while there is room, shrinking toward the minimum as windows pile up (like
+    /// the Windows taskbar) rather than pushing buttons off the panel edge.
+    fn taskbar_fitted_label_width(&self, count: usize, reserve_chevron: bool) -> f32 {
+        let applet = &self.core.applet;
+        let max = taskbar_label_width(applet.suggested_size(false).0);
+        // Vertical panels are icon-only, so the label width never applies.
+        if !applet.is_horizontal() || count == 0 {
+            return max;
         }
+        let Some(slot) = self.taskbar_slot_width() else {
+            return max;
+        };
+        let reserved = self.pinned_list.len() as f32 * taskbar_icon_button_extent(applet)
+            + if reserve_chevron {
+                taskbar_chevron_extent(applet)
+            } else {
+                0.0
+            };
+        let per_button = (slot - reserved).max(0.0) / count as f32 - taskbar_button_chrome(applet);
+        per_button.clamp(taskbar_label_min_width(applet.suggested_size(false).0), max)
+    }
 
-        // calculation of active_index based on favorite_index if there is still not enough space
-        let active_index_max = (btn_count as i32)
-            - (self.pinned_list.len() as i32).saturating_sub(favorite_index as i32);
-        if active_index_max >= self.active_list.len() as i32 {
-            active_index = Some(self.active_list.len());
-        } else {
-            active_index = Some((active_index_max.max(2) as usize).min(self.active_list.len()));
-        }
+    /// How many buttons stay on the panel; anything past the cutoff moves into the
+    /// overflow popup behind the "⌃" button. `None` means the whole list fits.
+    ///
+    /// Returns `(favorites_cutoff, active_cutoff)`. Favourites never fold: this
+    /// fork pins nothing by default and pinned entries are icon-only, so folding
+    /// them would only ever add a chevron opening an empty popup.
+    fn panel_overflow_lengths(&self) -> (Option<usize>, Option<usize>) {
+        let Some(slot) = self.taskbar_slot_width() else {
+            return (None, None);
+        };
+        let applet = &self.core.applet;
+        let active_cnt = self.visible_active_count();
+        let available =
+            (slot - self.pinned_list.len() as f32 * taskbar_icon_button_extent(applet)).max(0.0);
+        // Buttons are elastic down to the minimum label width, so only the
+        // minimum decides whether a window still fits on the panel.
+        let min_button =
+            taskbar_button_chrome(applet) + taskbar_label_min_width(applet.suggested_size(false).0);
 
-        // final calculation of favorite_index if there is still not enough space
-        if let Some(active_index) = active_index {
-            let favorite_index_max = (btn_count as i32) - active_index as i32;
-            favorite_index = favorite_index_max.max(2) as usize;
-        } else {
-            favorite_index = (btn_count as usize).min(self.pinned_list.len());
+        if active_cnt as f32 * min_button <= available {
+            return (None, None);
         }
-        // tracing::error!("{} {} {:?}", btn_count, favorite_index, active_index);
-        (Some(favorite_index), active_index)
+        // The chevron takes panel space too, but only an icon's worth.
+        let fits = ((available - taskbar_chevron_extent(applet)) / min_button).floor();
+        let fits = if fits.is_finite() && fits >= 1.0 {
+            fits as usize
+        } else {
+            1
+        };
+        // Stay strictly below the list length so `view` actually draws the
+        // chevron — otherwise the hidden windows become unreachable.
+        (None, Some(fits.min(active_cnt.saturating_sub(1)).max(1)))
     }
 
     fn currently_active_toplevel(&self) -> Vec<ExtForeignToplevelHandleV1> {
@@ -1675,22 +1727,27 @@ impl cosmic::Application for CosmicAppList {
                             height: *height as i32,
                         };
                     }
-                    let applet_suggested_size = self.core.applet.suggested_size(false).0
-                        + 2 * self.core.applet.suggested_padding(false).0;
+                    let applet_suggested_size = (self.core.applet.suggested_size(false).0
+                        + 2 * self.core.applet.suggested_padding(false).0)
+                        as f32;
                     let (_favorite_popup_cutoff, active_popup_cutoff) =
                         self.panel_overflow_lengths();
-                    let popup_applet_count =
-                        self.active_list.len().saturating_sub(
-                            (active_popup_cutoff.unwrap_or_default()).saturating_sub(1),
-                        ) as f32;
-                    let popup_applet_size = applet_suggested_size as f32 * popup_applet_count
-                        + 4.0 * (popup_applet_count - 1.);
+                    // Windows past the cutoff are the ones in the popup. Size it
+                    // for labelled buttons, not bare icons, or the titles clip.
+                    let popup_applet_count = self
+                        .visible_active_count()
+                        .saturating_sub(active_popup_cutoff.unwrap_or_default())
+                        as f32;
+                    let popup_button_size = taskbar_button_chrome(&self.core.applet)
+                        + taskbar_label_width(self.core.applet.suggested_size(false).0);
+                    let popup_applet_size = popup_button_size * popup_applet_count
+                        + 4.0 * (popup_applet_count - 1.).max(0.);
                     let (max_width, max_height) = match self.core.applet.anchor {
                         PanelAnchor::Top | PanelAnchor::Bottom => {
-                            (popup_applet_size, applet_suggested_size as f32)
+                            (popup_applet_size, applet_suggested_size)
                         }
                         PanelAnchor::Left | PanelAnchor::Right => {
-                            (applet_suggested_size as f32, popup_applet_size)
+                            (applet_suggested_size, popup_applet_size)
                         }
                     };
                     popup_settings.positioner.size_limits = Limits::NONE
@@ -1839,6 +1896,8 @@ impl cosmic::Application for CosmicAppList {
                             dot_radius,
                             self.core.main_window_id().unwrap(),
                             Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                            // Pinned entries render icon-only, so the width is moot.
+                            taskbar_label_width(self.core.applet.suggested_size(false).0),
                         ),
                         dock_item
                             .desktop_info
@@ -1899,6 +1958,7 @@ impl cosmic::Application for CosmicAppList {
                     dot_radius,
                     self.core.main_window_id().unwrap(),
                     Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                    taskbar_label_width(self.core.applet.suggested_size(false).0),
                 ),
             );
         } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
@@ -1923,14 +1983,15 @@ impl cosmic::Application for CosmicAppList {
             })
             .collect();
 
-        let mut active: Vec<_> =
-            filtered_active_list[..active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
-                if n < filtered_active_list.len() {
-                    n.saturating_sub(1)
-                } else {
-                    n
-                }
-            })]
+        // The cutoff counts buttons that stay on the panel; the rest live in the
+        // overflow popup. Labels shrink to fill whatever the visible ones get.
+        let active_visible = active_popup_cutoff
+            .map_or(filtered_active_list.len(), |n| {
+                n.min(filtered_active_list.len())
+            });
+        let active_label_width =
+            self.taskbar_fitted_label_width(active_visible, active_popup_cutoff.is_some());
+        let mut active: Vec<_> = filtered_active_list[..active_visible]
                 .iter()
                 .map(|dock_item| {
                     let filtered_is_focused = dock_item
@@ -1952,6 +2013,7 @@ impl cosmic::Application for CosmicAppList {
                                 dot_radius,
                                 self.core.main_window_id().unwrap(),
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                                active_label_width,
                             ),
                             dock_item.window_label(&self.locales),
                             self.popup.is_some(),
@@ -1985,26 +2047,12 @@ impl cosmic::Application for CosmicAppList {
             active.push(btn);
         }
 
-        let window_size = self.core.applet.suggested_bounds.as_ref();
-        let max_num = if self.core.applet.is_horizontal() {
-            let suggested_width = self.core.applet.suggested_size(false).0
-                + self.core.applet.suggested_padding(false).0 * 2;
-            window_size
-                .map(|w| w.width)
-                .map_or(u32::MAX, |b| (b / suggested_width as f32) as u32) as usize
-        } else {
-            let suggested_height = self.core.applet.suggested_size(false).1
-                + self.core.applet.suggested_padding(false).0 * 2;
-            window_size
-                .map(|w| w.height)
-                .map_or(u32::MAX, |b| (b / suggested_height as f32) as u32) as usize
-        }
-        .max(4);
-        if max_num < favorites.len() + active.len() {
-            let active_leftover = max_num.saturating_sub(favorites.len());
-            favorites.truncate(max_num - active_leftover);
-            active.truncate(active_leftover);
-        }
+        // NOTE: upstream app-list also hard-truncates the button lists here to a
+        // bare-icon estimate floored at 4. That cap is icon-only (it has no idea a
+        // taskbar button carries a title) and it drops buttons *silently*, with no
+        // chevron to reach them — which is exactly how windows went missing. The
+        // label-aware `panel_overflow_lengths` above is the single source of truth
+        // now, so the second cap is gone.
         let (w, h, favorites, active, divider) = if is_horizontal {
             (
                 Length::Shrink,
@@ -2345,12 +2393,10 @@ impl cosmic::Application for CosmicAppList {
             let active: Vec<_> = filtered_active_list
                 .iter()
                 .rev()
-                .take(active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
-                    if n < filtered_active_list.len() {
-                        filtered_active_list.len() - n + 1
-                    } else {
-                        0
-                    }
+                // The panel keeps the first `cutoff` windows; the popup shows the
+                // remainder (taken from the end, hence the `.rev()` above).
+                .take(active_popup_cutoff.map_or(0, |n| {
+                    filtered_active_list.len().saturating_sub(n)
                 }))
                 .map(|dock_item| {
                     let filtered_is_focused = dock_item
@@ -2372,6 +2418,9 @@ impl cosmic::Application for CosmicAppList {
                                 dot_radius,
                                 id,
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                                // Popups are not squeezed by the panel width, so
+                                // items there keep full-width labels.
+                                taskbar_label_width(self.core.applet.suggested_size(false).0),
                             ),
                             dock_item.window_label(&self.locales),
                             self.popup.is_some(),
@@ -2476,6 +2525,9 @@ impl cosmic::Application for CosmicAppList {
                                 dot_radius,
                                 id,
                                 Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                                // Popups are not squeezed by the panel width, so
+                                // items there keep full-width labels.
+                                taskbar_label_width(self.core.applet.suggested_size(false).0),
                             ),
                             dock_item.window_label(&self.locales),
                             self.popup.is_some(),
