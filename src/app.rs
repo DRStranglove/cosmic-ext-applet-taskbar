@@ -47,7 +47,7 @@ use cosmic::{
         icon::{self, from_name},
         image::Handle,
         rectangle_tracker::{RectangleTracker, RectangleUpdate, rectangle_tracker_subscription},
-        svg, text,
+        scrollable, svg, text,
     },
 };
 use cosmic::{
@@ -156,6 +156,13 @@ fn taskbar_label_width(icon_size: u16) -> f32 {
     icon_size as f32 * 5.0
 }
 
+/// Widest title label for a button inside the active-windows overflow popup.
+/// Wider than [`taskbar_label_width`]: the popup is not squeezed by the panel
+/// width and has no hover tooltip, so this is the only place a long title shows.
+fn taskbar_overflow_label_width(icon_size: u16) -> f32 {
+    icon_size as f32 * 12.0
+}
+
 /// Narrowest a title label may shrink to. Past this a label is too short to tell
 /// windows apart, so extra windows go to the overflow popup instead.
 fn taskbar_label_min_width(icon_size: u16) -> f32 {
@@ -172,6 +179,20 @@ fn taskbar_button_chrome(applet: &Context) -> f32 {
     (applet.suggested_size(false).0 + applet.suggested_padding(false).0 * 2) as f32
         + TASKBAR_LABEL_SPACING
         + applet.spacing as f32
+}
+
+/// Height of one window button as `as_icon` renders it: the icon plus the
+/// button's top and bottom padding. The indicator dot is absorbed by the padding
+/// (see `AppletIconData::new`), so it adds nothing. The padding that applies is
+/// the cross-axis one on horizontal panels and the major-axis one on vertical.
+fn taskbar_button_height(applet: &Context) -> f32 {
+    let (major_padding, cross_padding) = applet.suggested_padding(false);
+    let v_padding = if applet.is_horizontal() {
+        cross_padding
+    } else {
+        major_padding
+    };
+    (applet.suggested_size(false).0 + v_padding * 2) as f32
 }
 
 /// Major-axis size of an icon-only button (a pinned entry with no window).
@@ -205,6 +226,33 @@ impl From<usize> for DockItemId {
     fn from(id: usize) -> Self {
         DockItemId::Item(id as u32)
     }
+}
+
+/// Parent window and anchor rectangle for the menu or window-list popup of dock
+/// item `item`, requested from window `requested`.
+///
+/// The parent is always the main (dock) window, never an overflow popup. iced's
+/// `done` handler only walks up to a popup's parents, so a popup nested in the
+/// overflow popup outlives it when the compositor dismisses the overflow, and
+/// the panel then kills the applet ("xdg_popup was destroyed while it was not
+/// the topmost popup"). Items shown inside an overflow popup have rectangles
+/// relative to that popup, so a request from there anchors to the dock's
+/// chevron button instead. Anything that is neither the main window nor the
+/// favorites overflow is treated as the active overflow (including a stale id).
+fn dock_popup_placement(
+    item: u32,
+    requested: window::Id,
+    main: window::Id,
+    favorites_overflow: Option<window::Id>,
+) -> (window::Id, DockItemId) {
+    let anchor = if requested == main {
+        DockItemId::Item(item)
+    } else if Some(requested) == favorites_overflow {
+        DockItemId::FavoritesOverflow
+    } else {
+        DockItemId::ActiveOverflow
+    };
+    (main, anchor)
 }
 
 #[derive(Debug, Clone)]
@@ -450,7 +498,6 @@ struct DndOffer {
 
 #[derive(Debug, Clone)]
 pub struct Popup {
-    parent: window::Id,
     id: window::Id,
     dock_item: DockItem,
     popup_type: PopupType,
@@ -795,12 +842,9 @@ impl CosmicAppList {
             .collect();
     }
 
-    /// Close any open popups.
-    fn close_popups(&mut self) -> Task<cosmic::Action<Message>> {
+    /// Close the overflow popups only (not the menu / window-list popup).
+    fn close_overflow_popups(&mut self) -> Task<cosmic::Action<Message>> {
         let mut commands = Vec::new();
-        if let Some(popup) = self.popup.take() {
-            commands.push(destroy_popup(popup.id));
-        }
         if let Some(popup) = self.overflow_active_popup.take() {
             commands.push(destroy_popup(popup));
         }
@@ -808,6 +852,26 @@ impl CosmicAppList {
             commands.push(destroy_popup(popup));
         }
         Task::batch(commands)
+    }
+
+    /// Close any open popups.
+    fn close_popups(&mut self) -> Task<cosmic::Action<Message>> {
+        let mut commands = Vec::new();
+        if let Some(popup) = self.popup.take() {
+            commands.push(destroy_popup(popup.id));
+        }
+        commands.push(self.close_overflow_popups());
+        Task::batch(commands)
+    }
+
+    /// True while any popup this applet owns is open. The dock's hover tooltips
+    /// key off this: a tooltip is a popup parented to the main window, and iced
+    /// destroys every popup above the requested parent when one opens, so a
+    /// tooltip shown while an overflow popup is up would close that popup.
+    fn has_open_popup(&self) -> bool {
+        self.popup.is_some()
+            || self.overflow_active_popup.is_some()
+            || self.overflow_favorites_popup.is_some()
     }
 
     /// Major-axis space the panel gave this applet (minus the divider), or `None`
@@ -1019,19 +1083,8 @@ impl cosmic::Application for CosmicAppList {
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         match message {
             Message::Popup(id, parent_window_id) => {
-                if let Some(Popup {
-                    parent,
-                    id: popup_id,
-                    ..
-                }) = self.popup.take()
-                {
-                    if parent == parent_window_id {
-                        return destroy_popup(popup_id);
-                    } else {
-                        self.overflow_active_popup = None;
-                        self.overflow_favorites_popup = None;
-                        return Task::batch([destroy_popup(popup_id), destroy_popup(parent)]);
-                    }
+                if let Some(Popup { id: popup_id, .. }) = self.popup.take() {
+                    return destroy_popup(popup_id);
                 }
                 if let Some(toplevel_group) = self
                     .active_list
@@ -1039,14 +1092,22 @@ impl cosmic::Application for CosmicAppList {
                     .chain(self.pinned_list.iter())
                     .find(|t| t.id == id)
                 {
-                    let Some(rectangle) = self.rectangles.get(&toplevel_group.id.into()) else {
+                    let Some(main_window_id) = self.core.main_window_id() else {
+                        return Task::none();
+                    };
+                    let (parent_window_id, anchor) = dock_popup_placement(
+                        toplevel_group.id,
+                        parent_window_id,
+                        main_window_id,
+                        self.overflow_favorites_popup,
+                    );
+                    let Some(rectangle) = self.rectangles.get(&anchor) else {
                         tracing::error!("No rectangle found for toplevel group");
                         return Task::none();
                     };
 
                     let new_id = window::Id::unique();
                     self.popup = Some(Popup {
-                        parent: parent_window_id,
                         id: new_id,
                         dock_item: toplevel_group.clone(),
                         popup_type: PopupType::RightClickMenu,
@@ -1075,23 +1136,18 @@ impl cosmic::Application for CosmicAppList {
                     let gpu_update = Task::perform(try_get_gpus(), |gpus| {
                         cosmic::Action::App(Message::GpuRequest(gpus))
                     });
-                    return Task::batch([gpu_update, get_popup(popup_settings)]);
+                    // Tear down any overflow popup the request came from (or
+                    // that is open next to the dock) rather than nesting in it.
+                    return Task::batch([
+                        self.close_overflow_popups(),
+                        gpu_update,
+                        get_popup(popup_settings),
+                    ]);
                 }
             }
             Message::ToplevelListPopup(id, parent_window_id) => {
-                if let Some(Popup {
-                    parent,
-                    id: popup_id,
-                    ..
-                }) = self.popup.take()
-                {
-                    if parent == parent_window_id {
-                        return destroy_popup(popup_id);
-                    } else {
-                        self.overflow_active_popup = None;
-                        self.overflow_favorites_popup = None;
-                        return Task::batch([destroy_popup(popup_id), destroy_popup(parent)]);
-                    }
+                if let Some(Popup { id: popup_id, .. }) = self.popup.take() {
+                    return destroy_popup(popup_id);
                 }
                 if let Some(toplevel_group) = self
                     .active_list
@@ -1106,13 +1162,21 @@ impl cosmic::Application for CosmicAppList {
                         }
                     }
 
-                    let Some(rectangle) = self.rectangles.get(&toplevel_group.id.into()) else {
+                    let Some(main_window_id) = self.core.main_window_id() else {
+                        return Task::none();
+                    };
+                    let (parent_window_id, anchor) = dock_popup_placement(
+                        toplevel_group.id,
+                        parent_window_id,
+                        main_window_id,
+                        self.overflow_favorites_popup,
+                    );
+                    let Some(rectangle) = self.rectangles.get(&anchor) else {
                         return Task::none();
                     };
 
                     let new_id = window::Id::unique();
                     self.popup = Some(Popup {
-                        parent: parent_window_id,
                         id: new_id,
                         dock_item: toplevel_group.clone(),
                         popup_type: PopupType::ToplevelList,
@@ -1158,7 +1222,9 @@ impl cosmic::Application for CosmicAppList {
                             .max_height(window_spacing * 2.0 + TOPLEVEL_BUTTON_HEIGHT),
                     };
 
-                    return get_popup(popup_settings);
+                    // Tear down any overflow popup the request came from (or
+                    // that is open next to the dock) rather than nesting in it.
+                    return Task::batch([self.close_overflow_popups(), get_popup(popup_settings)]);
                 }
             }
             Message::ToplevelHoverChanged(handle, entering) => {
@@ -1204,9 +1270,9 @@ impl cosmic::Application for CosmicAppList {
                 if let Some(tx) = self.wayland_sender.as_ref() {
                     let _ = tx.send(WaylandRequest::Toplevel(ToplevelRequest::Activate(handle)));
                 }
-                if let Some(p) = self.popup.take() {
-                    return destroy_popup(p.id);
-                }
+                // Also closes the overflow popups, so picking a window there
+                // ends with the client destroying them.
+                return self.close_popups();
             }
             Message::Toggle(handle) => {
                 if let Some(tx) = self.wayland_sender.as_ref() {
@@ -1216,9 +1282,8 @@ impl cosmic::Application for CosmicAppList {
                         ToplevelRequest::Activate(handle)
                     }));
                 }
-                if let Some(p) = self.popup.take() {
-                    return destroy_popup(p.id);
-                }
+                // Same as `Activate`: also closes the overflow popups.
+                return self.close_popups();
             }
             Message::CloseToplevel(handle) => {
                 if let Some(tx) = self.wayland_sender.as_ref() {
@@ -1727,29 +1792,20 @@ impl cosmic::Application for CosmicAppList {
                             height: *height as i32,
                         };
                     }
-                    let applet_suggested_size = (self.core.applet.suggested_size(false).0
-                        + 2 * self.core.applet.suggested_padding(false).0)
-                        as f32;
                     let (_favorite_popup_cutoff, active_popup_cutoff) =
                         self.panel_overflow_lengths();
-                    // Windows past the cutoff are the ones in the popup. Size it
-                    // for labelled buttons, not bare icons, or the titles clip.
+                    // Windows past the cutoff are the ones in the popup. They are
+                    // listed in one column, so the width is one labelled button
+                    // (or the titles clip) and the height is one button per window
+                    // plus the 4 px spacing the view puts between them.
                     let popup_applet_count = self
                         .visible_active_count()
                         .saturating_sub(active_popup_cutoff.unwrap_or_default())
                         as f32;
-                    let popup_button_size = taskbar_button_chrome(&self.core.applet)
-                        + taskbar_label_width(self.core.applet.suggested_size(false).0);
-                    let popup_applet_size = popup_button_size * popup_applet_count
+                    let max_width = taskbar_button_chrome(&self.core.applet)
+                        + taskbar_overflow_label_width(self.core.applet.suggested_size(false).0);
+                    let max_height = taskbar_button_height(&self.core.applet) * popup_applet_count
                         + 4.0 * (popup_applet_count - 1.).max(0.);
-                    let (max_width, max_height) = match self.core.applet.anchor {
-                        PanelAnchor::Top | PanelAnchor::Bottom => {
-                            (popup_applet_size, applet_suggested_size)
-                        }
-                        PanelAnchor::Left | PanelAnchor::Right => {
-                            (applet_suggested_size, popup_applet_size)
-                        }
-                    };
                     popup_settings.positioner.size_limits = Limits::NONE
                         .max_width(max_width)
                         .min_width(1.)
@@ -1904,7 +1960,7 @@ impl cosmic::Application for CosmicAppList {
                             .full_name(&self.locales)
                             .unwrap_or_default()
                             .into_owned(),
-                        self.popup.is_some(),
+                        self.has_open_popup(),
                         Message::Surface,
                         None,
                     )
@@ -2016,7 +2072,7 @@ impl cosmic::Application for CosmicAppList {
                                 active_label_width,
                             ),
                             dock_item.window_label(&self.locales),
-                            self.popup.is_some(),
+                            self.has_open_popup(),
                             Message::Surface,
                             None,
                         )
@@ -2405,47 +2461,34 @@ impl cosmic::Application for CosmicAppList {
                         .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
                         .any(|y| focused_item.contains(&y.0.foreign_toplevel));
 
-                    self.core
-                        .applet
-                        .applet_tooltip(
-                            dock_item.as_icon(
-                                &self.core.applet,
-                                self.rectangle_tracker.as_ref(),
-                                self.popup.is_none(),
-                                self.config.enable_drag_source,
-                                self.gpus.as_deref(),
-                                filtered_is_focused,
-                                dot_radius,
-                                id,
-                                Some(&|info| self.is_on_current_monitor_and_workspace(info)),
-                                // Popups are not squeezed by the panel width, so
-                                // items there keep full-width labels.
-                                taskbar_label_width(self.core.applet.suggested_size(false).0),
-                            ),
-                            dock_item.window_label(&self.locales),
-                            self.popup.is_some(),
-                            Message::Surface,
-                            Some(id),
-                        )
-                        .into()
+                    // No hover tooltip here: it would be an xdg_popup nested in
+                    // this overflow popup (see `dock_popup_placement`).
+                    dock_item.as_icon(
+                        &self.core.applet,
+                        self.rectangle_tracker.as_ref(),
+                        self.popup.is_none(),
+                        self.config.enable_drag_source,
+                        self.gpus.as_deref(),
+                        filtered_is_focused,
+                        dot_radius,
+                        id,
+                        Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                        // Popups are not squeezed by the panel width, and have no
+                        // tooltip to show the whole title, so items there get the
+                        // wider overflow cap.
+                        taskbar_overflow_label_width(self.core.applet.suggested_size(false).0),
+                    )
                 })
                 .collect();
-            let content = match &self.core.applet.anchor {
-                PanelAnchor::Left | PanelAnchor::Right => container(
-                    Column::with_children(active)
-                        .spacing(4.0)
-                        .align_x(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-                PanelAnchor::Top | PanelAnchor::Bottom => container(
-                    Row::with_children(active)
-                        .spacing(4.0)
-                        .align_y(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-            };
+            // A vertical list on every panel anchor: the wide labels would not fit
+            // side by side. Scrolls once the list outgrows the popup's height limit.
+            let content = scrollable(
+                Column::with_children(active)
+                    .spacing(4.0)
+                    .align_x(Alignment::Start)
+                    .width(Length::Shrink)
+                    .height(Length::Shrink),
+            );
             // send clear popup on press content if there is an active popup
             let content: Element<_> = if self.popup.is_some() {
                 mouse_area(content)
@@ -2512,29 +2555,22 @@ impl cosmic::Application for CosmicAppList {
                         .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
                         .any(|y| focused_item.contains(&y.0.foreign_toplevel));
 
-                    self.core
-                        .applet
-                        .applet_tooltip(
-                            dock_item.as_icon(
-                                &self.core.applet,
-                                self.rectangle_tracker.as_ref(),
-                                self.popup.is_none(),
-                                self.config.enable_drag_source,
-                                self.gpus.as_deref(),
-                                filtered_is_focused,
-                                dot_radius,
-                                id,
-                                Some(&|info| self.is_on_current_monitor_and_workspace(info)),
-                                // Popups are not squeezed by the panel width, so
-                                // items there keep full-width labels.
-                                taskbar_label_width(self.core.applet.suggested_size(false).0),
-                            ),
-                            dock_item.window_label(&self.locales),
-                            self.popup.is_some(),
-                            Message::Surface,
-                            Some(id),
-                        )
-                        .into()
+                    // No hover tooltip here: it would be an xdg_popup nested in
+                    // this overflow popup (see `dock_popup_placement`).
+                    dock_item.as_icon(
+                        &self.core.applet,
+                        self.rectangle_tracker.as_ref(),
+                        self.popup.is_none(),
+                        self.config.enable_drag_source,
+                        self.gpus.as_deref(),
+                        filtered_is_focused,
+                        dot_radius,
+                        id,
+                        Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                        // Popups are not squeezed by the panel width, so
+                        // items there keep full-width labels.
+                        taskbar_label_width(self.core.applet.suggested_size(false).0),
+                    )
                 })
                 .collect();
             let content = match &self.core.applet.anchor {
@@ -2671,5 +2707,57 @@ impl AsMimeTypes for DndPathBuf {
 
     fn as_bytes(&self, _mime_type: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
         Some(Cow::Owned(self.0.to_str()?.as_bytes().to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_request_anchors_to_its_own_button_under_the_main_window() {
+        let main = window::Id::unique();
+        let favorites = window::Id::unique();
+        assert_eq!(
+            dock_popup_placement(7, main, main, Some(favorites)),
+            (main, DockItemId::Item(7))
+        );
+        assert_eq!(
+            dock_popup_placement(7, main, main, None),
+            (main, DockItemId::Item(7))
+        );
+    }
+
+    #[test]
+    fn overflow_request_is_reparented_to_main_and_anchored_to_its_chevron() {
+        let main = window::Id::unique();
+        let active_overflow = window::Id::unique();
+        let favorites_overflow = window::Id::unique();
+        assert_eq!(
+            dock_popup_placement(7, active_overflow, main, Some(favorites_overflow)),
+            (main, DockItemId::ActiveOverflow)
+        );
+        assert_eq!(
+            dock_popup_placement(7, favorites_overflow, main, Some(favorites_overflow)),
+            (main, DockItemId::FavoritesOverflow)
+        );
+    }
+
+    #[test]
+    fn overflow_label_cap_is_wider_and_the_dock_cap_is_unchanged() {
+        assert_eq!(taskbar_label_width(48), 240.0);
+        assert_eq!(taskbar_overflow_label_width(48), 576.0);
+    }
+
+    #[test]
+    fn stale_overflow_id_still_parents_to_main() {
+        // The overflow popup was already forgotten (`None`) when a late click from
+        // its dying surface arrives: the parent must still be the main window.
+        let main = window::Id::unique();
+        let stale = window::Id::unique();
+        assert_eq!(
+            dock_popup_placement(7, stale, main, None),
+            (main, DockItemId::ActiveOverflow)
+        );
     }
 }
